@@ -1,33 +1,44 @@
 """
-Sales Prediction Script
-Dự đoán sản phẩm tiếp theo cho khách hàng
-Run: python predict.py --customer-id "C68N1000574"
+Predict next purchase for a single customer
+Usage: python predict_customer.py --customer "KH001"
 """
 
 import argparse
 import torch
 import pandas as pd
-import pickle
+import numpy as np
 from pathlib import Path
+import pickle
 from datetime import datetime
-import sys
 
 from config import get_config
-from model import SalesPredictionModel
 from geocache import GeoCache
 from features import FeatureEngineer
 
 
-def load_model(model_path: Path, config):
-    """Load trained model"""
-    print(f"Loading model from {model_path}...")
+def load_model_and_mappings(config):
+    """Load trained model and mappings"""
+    print("\n" + "="*80)
+    print("LOADING MODEL AND MAPPINGS")
+    print("="*80)
     
+    # Load final model
+    model_path = config.MODEL_DIR / 'final_model.pth'
+    
+    if not model_path.exists():
+        # Try best model
+        model_path = config.MODEL_DIR / 'best_model.pth'
+    
+    if not model_path.exists():
+        raise FileNotFoundError(f"No model found in {config.MODEL_DIR}")
+    
+    print(f"Loading model from: {model_path}")
     checkpoint = torch.load(model_path, map_location=config.DEVICE, weights_only=False)
     
-    # Get model info
-    num_products = checkpoint['num_products']
-    product_to_id = checkpoint['product_to_id']
-    id_to_product = {v: k for k, v in product_to_id.items()}
+    # Extract components
+    product_to_id = checkpoint.get('product_to_id')
+    encoders = checkpoint.get('encoders')
+    num_products = checkpoint.get('num_products', len(product_to_id))
     
     # Create model
     from model import create_model
@@ -35,86 +46,155 @@ def load_model(model_path: Path, config):
     model.load_state_dict(checkpoint['model_state_dict'])
     model.eval()
     
-    print(f"✓ Model loaded successfully!")
-    print(f"  Products: {num_products:,}")
+    # Create reverse mapping
+    id_to_product = {v: k for k, v in product_to_id.items()}
     
-    return model, product_to_id, id_to_product
+    print(f"✅ Model loaded successfully!")
+    print(f"   Total products: {num_products}")
+    print(f"   Device: {config.DEVICE}")
+    
+    return model, product_to_id, id_to_product, encoders
 
 
-def get_customer_history(customer_id: str, data_path: Path, max_rows: int = 100000):
-    """Lấy lịch sử mua hàng của khách"""
-    print(f"\nLoading customer history for: {customer_id}")
+def get_customer_data(customer_id, raw_data_path):
+    """Get customer's purchase history"""
+    print(f"\n{'='*80}")
+    print(f"LOADING CUSTOMER DATA: {customer_id}")
+    print("="*80)
     
-    # Load data (có thể load toàn bộ hoặc sample)
-    df = pd.read_csv(data_path, encoding='utf-8-sig', nrows=max_rows, low_memory=False)
+    # Load raw data
+    print("Loading raw data...")
+    df = pd.read_csv(raw_data_path, encoding='utf-8-sig', low_memory=False)
     
     # Filter customer
+    from column_mapper import map_columns
+    df = map_columns(df)
+    
     customer_df = df[df['MÃ KHÁCH HÀNG'] == customer_id].copy()
     
     if len(customer_df) == 0:
-        print(f"⚠️  Customer {customer_id} not found!")
-        return None
+        raise ValueError(f"Customer {customer_id} not found in dataset!")
     
-    print(f"✓ Found {len(customer_df)} orders")
+    # Convert numeric columns
+    numeric_cols = ['THÀNH TIỀN ĐƠN BÁN', 'SỐ LƯỢNG ĐƠN BÁN', 'ĐƠN GIÁ ĐƠN BÁN', 
+                    'CHIẾT KHẤU ĐƠN BÁN', 'TỔNG TIỀN ĐƠN BÁN']
+    for col in numeric_cols:
+        if col in customer_df.columns:
+            customer_df[col] = pd.to_numeric(customer_df[col], errors='coerce').fillna(0)
+    
+    print(f"✅ Found {len(customer_df)} orders for customer {customer_id}")
+    print(f"   Date range: {customer_df['NGÀY TẠO ĐƠN BÁN'].min()} to {customer_df['NGÀY TẠO ĐƠN BÁN'].max()}")
+    print(f"   Total revenue: {customer_df['THÀNH TIỀN ĐƠN BÁN'].sum():,.0f} VND")
+    print(f"   Unique products: {customer_df['MÃ SẢN PHẨM ĐƠN BÁN'].nunique()}")
     
     return customer_df
 
 
-def prepare_customer_features(customer_df: pd.DataFrame, config, geo_cache):
-    """Chuẩn bị features cho dự đoán"""
-    print("Preparing features...")
-    
-    from column_mapper import map_columns
-    
-    # Map columns
-    customer_df = map_columns(customer_df)
+def prepare_customer_features(customer_df, config, geo_cache, encoders):
+    """Process customer data into features"""
+    print(f"\n{'='*80}")
+    print("FEATURE ENGINEERING")
+    print("="*80)
     
     # Feature engineering
     engineer = FeatureEngineer(customer_df, config.CURRENT_DATE, geo_cache)
+    engineer.encoders = encoders
     engineer.process(fit_mode=False)
     
     # Create sequence
-    sequence = engineer.prepare_sequences(config.MAX_SEQ_LEN)
+    sequences = engineer.prepare_sequences(config.MAX_SEQ_LEN)
     
-    if len(sequence) == 0:
-        print("⚠️  Cannot create sequence!")
-        return None
+    if len(sequences) == 0:
+        raise ValueError("Failed to create sequence for customer!")
     
-    return sequence.iloc[-1]  # Get latest sequence
+    print(f"✅ Features created successfully!")
+    
+    return sequences.iloc[0]  # Get first (only) sequence
 
 
-def predict_next_purchase(model, sequence, product_to_id, id_to_product, config, top_k=5):
-    """Dự đoán sản phẩm tiếp theo"""
-    print("\n" + "="*80)
+def create_input_tensors(sequence, product_to_id, config):
+    """Convert sequence to model inputs"""
+    
+    def pad_sequence(seq, max_len, pad_value=0):
+        seq = list(seq)
+        if len(seq) > max_len:
+            return seq[-max_len:]
+        return [pad_value] * (max_len - len(seq)) + seq
+    
+    # Product IDs
+    product_ids = [product_to_id.get(p, 0) for p in sequence['product_seq']]
+    product_ids = pad_sequence(product_ids, config.MAX_SEQ_LEN, 0)
+    
+    # Quantities
+    qty = pad_sequence(sequence['qty_seq'], config.MAX_SEQ_LEN, 0)
+    
+    # Revenue
+    revenue = pad_sequence(sequence['revenue_seq'], config.MAX_SEQ_LEN, 0)
+    
+    # Discount
+    discount = pad_sequence(sequence['discount_seq'], config.MAX_SEQ_LEN, 0)
+    
+    # Temporal changes
+    week_change = pad_sequence(sequence['week_change_seq'], config.MAX_SEQ_LEN, 0)
+    month_change = pad_sequence(sequence['month_change_seq'], config.MAX_SEQ_LEN, 0)
+    quarter_change = pad_sequence(sequence['quarter_change_seq'], config.MAX_SEQ_LEN, 0)
+    year_change = pad_sequence(sequence['year_change_seq'], config.MAX_SEQ_LEN, 0)
+    
+    # Customer features
+    customer_features = [
+        sequence['recency'],
+        sequence['frequency'],
+        sequence['monetary'],
+        sequence['customer_lifetime'],
+        sequence['num_unique_products'],
+        sequence['avg_discount'],
+        sequence['distance_to_employee'],
+        sequence['customer_segment'],
+        sequence['is_walkin'],
+        sequence['is_weekend'],
+        sequence['hour'],
+        sequence['day_of_week'],
+        sequence['month'],
+        sequence['quarter']
+    ]
+    
+    # Convert to tensors
+    inputs = {
+        'product_ids': torch.tensor([product_ids], dtype=torch.long),
+        'qty': torch.tensor([qty], dtype=torch.float).unsqueeze(-1),
+        'revenue': torch.tensor([revenue], dtype=torch.float).unsqueeze(-1),
+        'discount': torch.tensor([discount], dtype=torch.float).unsqueeze(-1),
+        'week_change': torch.tensor([week_change], dtype=torch.float).unsqueeze(-1),
+        'month_change': torch.tensor([month_change], dtype=torch.float).unsqueeze(-1),
+        'quarter_change': torch.tensor([quarter_change], dtype=torch.float).unsqueeze(-1),
+        'year_change': torch.tensor([year_change], dtype=torch.float).unsqueeze(-1),
+        'customer_features': torch.tensor([customer_features], dtype=torch.float)
+    }
+    
+    return inputs
+
+
+def predict_next_purchase(model, inputs, id_to_product, config, top_k=5):
+    """Make prediction"""
+    print(f"\n{'='*80}")
     print("MAKING PREDICTION")
     print("="*80)
     
-    # Prepare input tensors
-    from dataset import SalesSequenceDataset
-    
-    # Create mini dataset with 1 sample
-    seq_df = pd.DataFrame([sequence])
-    
-    dataset = SalesSequenceDataset(seq_df, product_to_id, config.MAX_SEQ_LEN)
-    
-    # Get the single sample
-    sample = dataset[0]
-    
-    # Add batch dimension
-    batch = {k: v.unsqueeze(0) for k, v in sample.items()}
+    # Move to device
+    inputs = {k: v.to(config.DEVICE) for k, v in inputs.items()}
     
     # Predict
     with torch.no_grad():
         outputs = model(
-            batch['product_ids'],
-            batch['qty'],
-            batch['revenue'],
-            batch['discount'],
-            batch['week_change'],
-            batch['month_change'],
-            batch['quarter_change'],
-            batch['year_change'],
-            batch['customer_features']
+            inputs['product_ids'],
+            inputs['qty'].squeeze(-1),
+            inputs['revenue'].squeeze(-1),
+            inputs['discount'].squeeze(-1),
+            inputs['week_change'].squeeze(-1),
+            inputs['month_change'].squeeze(-1),
+            inputs['quarter_change'].squeeze(-1),
+            inputs['year_change'].squeeze(-1),
+            inputs['customer_features']
         )
     
     # Get predictions
@@ -124,120 +204,114 @@ def predict_next_purchase(model, sequence, product_to_id, id_to_product, config,
     predicted_discount = outputs['discount'][0].item()
     
     # Top K products
-    top_probs, top_indices = torch.topk(product_probs, k=min(top_k, len(product_probs)))
+    top_probs, top_indices = torch.topk(product_probs, min(top_k, len(product_probs)))
     
-    # Display results
-    print("\n🎯 TOP PREDICTED PRODUCTS:")
-    print("-" * 80)
+    predictions = []
+    for prob, idx in zip(top_probs, top_indices):
+        product_code = id_to_product.get(idx.item(), 'UNKNOWN')
+        predictions.append({
+            'product': product_code,
+            'probability': prob.item() * 100,
+            'predicted_qty': max(1, int(predicted_qty)),
+            'predicted_revenue': max(0, predicted_revenue),
+            'predicted_discount': max(0, min(1, predicted_discount))
+        })
     
-    for i, (prob, idx) in enumerate(zip(top_probs, top_indices), 1):
-        product_name = id_to_product.get(idx.item(), 'UNKNOWN')
-        print(f"{i}. {product_name}")
-        print(f"   Probability: {prob.item()*100:.2f}%")
-        print(f"   Expected Quantity: {predicted_qty:.1f}")
-        print(f"   Expected Revenue: {predicted_revenue:,.0f} VND")
-        print(f"   Expected Discount: {predicted_discount*100:.1f}%")
-        print()
-    
-    return {
-        'top_products': [id_to_product.get(idx.item(), 'UNKNOWN') for idx in top_indices],
-        'probabilities': top_probs.tolist(),
-        'quantity': predicted_qty,
-        'revenue': predicted_revenue,
-        'discount': predicted_discount
-    }
+    return predictions
 
 
-def show_customer_summary(customer_df: pd.DataFrame):
-    """Hiển thị thông tin khách hàng"""
+def display_results(customer_id, sequence, predictions):
+    """Display prediction results"""
     print("\n" + "="*80)
-    print("CUSTOMER SUMMARY")
+    print("PREDICTION RESULTS")
     print("="*80)
     
-    latest = customer_df.iloc[-1]
+    print(f"\nCustomer ID: {customer_id}")
+    print(f"Purchase History: {len(sequence['product_seq'])} orders")
+    print(f"RFM Metrics:")
+    print(f"  - Recency: {sequence['recency']} days")
+    print(f"  - Frequency: {sequence['frequency']:.0f} orders")
+    print(f"  - Monetary: {sequence['monetary']:,.0f} VND")
+    print(f"  - Customer Lifetime: {sequence['customer_lifetime']} days")
+    print(f"  - Unique Products: {sequence['num_unique_products']}")
     
-    print(f"Customer ID: {latest['MÃ KHÁCH HÀNG']}")
-    print(f"Customer Name: {latest.get('TÊN KHÁCH HÀNG', 'N/A')}")
-    print(f"Province: {latest.get('TỈNH/TP CỦA KHÁCH HÀNG', 'N/A')}")
-    print(f"Total Orders: {len(customer_df):,}")
-    print(f"Total Revenue: {customer_df['THÀNH TIỀN ĐƠN BÁN'].sum():,.0f} VND")
-    print(f"Average Order: {customer_df['THÀNH TIỀN ĐƠN BÁN'].mean():,.0f} VND")
+    print(f"\nLast 5 purchases:")
+    for i, (prod, qty, rev) in enumerate(zip(
+        sequence['product_seq'][-5:],
+        sequence['qty_seq'][-5:],
+        sequence['revenue_seq'][-5:]
+    ), 1):
+        print(f"  {i}. {prod} - Qty: {qty:.0f}, Revenue: {rev:,.0f} VND")
     
-    print(f"\nLast Order Date: {latest['NGÀY TẠO ĐƠN BÁN']}")
-    
-    print("\nTop 5 Products Purchased:")
-    top_products = customer_df['MÃ SẢN PHẨM ĐƠN BÁN'].value_counts().head(5)
-    for i, (product, count) in enumerate(top_products.items(), 1):
-        print(f"  {i}. {product}: {count} times")
-    
+    print(f"\n{'='*80}")
+    print("TOP PREDICTIONS FOR NEXT PURCHASE")
     print("="*80)
+    
+    for i, pred in enumerate(predictions, 1):
+        print(f"\n{i}. Product: {pred['product']}")
+        print(f"   Confidence: {pred['probability']:.2f}%")
+        print(f"   Predicted Quantity: {pred['predicted_qty']}")
+        print(f"   Predicted Revenue: {pred['predicted_revenue']:,.0f} VND")
+        print(f"   Predicted Discount: {pred['predicted_discount']*100:.1f}%")
+    
+    print("\n" + "="*80)
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Predict next purchase for customer')
-    parser.add_argument('--customer-id', type=str, required=True, help='Customer ID')
-    parser.add_argument('--model-path', type=str, default='models/best_model.pth', 
-                       help='Path to trained model')
-    parser.add_argument('--data-path', type=str, default='../data/raw/merged_2025.csv',
-                       help='Path to data file')
-    parser.add_argument('--top-k', type=int, default=5, help='Number of top predictions')
-    parser.add_argument('--max-rows', type=int, default=100000, 
-                       help='Max rows to load from data')
+    """Main prediction pipeline"""
+    parser = argparse.ArgumentParser(description='Predict next purchase for a customer')
+    parser.add_argument('--customer', type=str, required=True, help='Customer ID')
+    parser.add_argument('--top-k', type=int, default=5, help='Number of top predictions to show')
+    parser.add_argument('--env', type=str, default='development', help='Environment config')
     
     args = parser.parse_args()
     
+    print("\n" + "="*80)
+    print("SALES PREDICTION - SINGLE CUSTOMER")
     print("="*80)
-    print("🔮 SALES PREDICTION SYSTEM")
+    print(f"Customer ID: {args.customer}")
+    print(f"Top K predictions: {args.top_k}")
     print("="*80)
     
     # Load config
-    config = get_config('development')
+    config = get_config(args.env)
     
-    # Load model
-    model_path = Path(args.model_path)
-    if not model_path.exists():
-        print(f"❌ Model not found: {model_path}")
-        print("Please train the model first using: python minimal_train.py")
-        sys.exit(1)
+    # Load model and mappings
+    model, product_to_id, id_to_product, encoders = load_model_and_mappings(config)
     
-    model, product_to_id, id_to_product = load_model(model_path, config)
-    
-    # Load customer history
-    data_path = Path(args.data_path)
-    customer_df = get_customer_history(args.customer_id, data_path, args.max_rows)
-    
-    if customer_df is None:
-        sys.exit(1)
-    
-    # Show customer summary
-    show_customer_summary(customer_df)
+    # Load customer data
+    customer_df = get_customer_data(args.customer, config.RAW_DATA_PATH)
     
     # Prepare features
     cache_file = config.CACHE_DIR / 'geocache.pkl'
     geo_cache = GeoCache(cache_file=cache_file)
     
-    sequence = prepare_customer_features(customer_df, config, geo_cache)
+    sequence = prepare_customer_features(customer_df, config, geo_cache, encoders)
     
-    if sequence is None:
-        sys.exit(1)
+    # Create input tensors
+    inputs = create_input_tensors(sequence, product_to_id, config)
     
-    # Predict
-    predictions = predict_next_purchase(
-        model, sequence, product_to_id, id_to_product, config, args.top_k
-    )
+    # Make prediction
+    predictions = predict_next_purchase(model, inputs, id_to_product, config, args.top_k)
     
-    # Save predictions
-    output_file = f"predictions_{args.customer_id}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
-    import json
-    with open(output_file, 'w', encoding='utf-8') as f:
-        json.dump({
-            'customer_id': args.customer_id,
-            'timestamp': datetime.now().isoformat(),
-            'predictions': predictions
-        }, f, indent=2, ensure_ascii=False)
+    # Display results
+    display_results(args.customer, sequence, predictions)
     
-    print(f"\n💾 Predictions saved to: {output_file}")
-    print("="*80)
+    # Save results
+    results_dir = config.LOGS_DIR / 'predictions'
+    results_dir.mkdir(exist_ok=True)
+    
+    results_file = results_dir / f'prediction_{args.customer}_{datetime.now().strftime("%Y%m%d_%H%M%S")}.txt'
+    
+    with open(results_file, 'w', encoding='utf-8') as f:
+        f.write(f"Customer: {args.customer}\n")
+        f.write(f"Prediction Date: {datetime.now()}\n\n")
+        f.write("Top Predictions:\n")
+        for i, pred in enumerate(predictions, 1):
+            f.write(f"{i}. {pred['product']} - {pred['probability']:.2f}% confidence\n")
+            f.write(f"   Qty: {pred['predicted_qty']}, Revenue: {pred['predicted_revenue']:,.0f} VND\n")
+    
+    print(f"\n✅ Results saved to: {results_file}")
 
 
 if __name__ == "__main__":

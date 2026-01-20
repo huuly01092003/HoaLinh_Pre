@@ -1,16 +1,9 @@
 """
 Data Manager for Processed Data
 Handles saving, loading, and caching of processed features
+FIXED: Removed encoding wrapper that was causing import hang
 """
-import sys
-import io
 
-# Fix Windows console encoding
-if sys.platform == 'win32':
-    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
-    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8')
-
-    
 import pickle
 import gzip
 import json

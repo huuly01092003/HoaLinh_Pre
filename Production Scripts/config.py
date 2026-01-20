@@ -1,6 +1,6 @@
 """
 Configuration Management for Sales Prediction System
-Optimized for Windows + Intel Ultra 7 255H (16 cores)
+FIXED VERSION - Correct path to DONHANG/data/
 """
 
 from datetime import datetime
@@ -9,22 +9,15 @@ from pathlib import Path
 import os
 
 # ============================================================================
-# WINDOWS + INTEL OPTIMIZATION (without IPEX)
+# WINDOWS + INTEL OPTIMIZATION
 # ============================================================================
 
-# Set optimal number of threads for Intel Ultra 7 255H (16 cores)
 torch.set_num_threads(16)
 torch.set_num_interop_threads(4)
-
-# Enable Intel MKL optimization (works on Windows)
 os.environ["MKL_NUM_THREADS"] = "16"
 os.environ["OMP_NUM_THREADS"] = "16"
 os.environ["NUMEXPR_NUM_THREADS"] = "16"
-
-# Enable TensorFloat-32 for faster computation (if available)
 torch.set_float32_matmul_precision('high')
-
-# Disable CUDA warnings
 os.environ["CUDA_VISIBLE_DEVICES"] = ""
 
 print("="*80)
@@ -35,15 +28,19 @@ print(f"CPU threads: {torch.get_num_threads()}")
 print(f"MKL enabled: {torch.backends.mkl.is_available()}")
 print(f"Platform: Windows + Intel Ultra 7 255H")
 print("="*80)
+
 # ============================================================================
 
 
 class Config:
-    """Base configuration class - Optimized for Intel Ultra 7 255H on Windows"""
+    """Base configuration class - FIXED PATHS"""
     
     # Project Structure
-    PROJECT_ROOT = Path(__file__).parent
-    DATA_DIR = PROJECT_ROOT.parent / 'data'  # ← THÊM .parent
+    PROJECT_ROOT = Path(__file__).parent  # Production Scripts/
+    
+    # ✅ FIX: Point to DONHANG/data/ (parent directory)
+    DATA_DIR = PROJECT_ROOT.parent / 'data'
+    
     MODEL_DIR = PROJECT_ROOT / 'models'
     LOGS_DIR = PROJECT_ROOT / 'logs'
     CACHE_DIR = PROJECT_ROOT / 'cache'
@@ -56,8 +53,8 @@ class Config:
     BEST_MODEL_PATH = MODEL_DIR / 'best_sales_model.pth'
     CHECKPOINT_DIR = MODEL_DIR / 'checkpoints'
     
-    # Training Parameters - Optimized for 16-core CPU
-    BATCH_SIZE = 64  # Balanced for CPU
+    # Training Parameters
+    BATCH_SIZE = 64
     EPOCHS = 20
     LEARNING_RATE = 0.001
     WEIGHT_DECAY = 1e-5
@@ -72,13 +69,13 @@ class Config:
     MAX_SEQ_LEN = 30
     NUM_CUSTOMER_SEGMENTS = 5
     
-    # System - Windows Optimized
+    # System
     DEVICE = torch.device("cpu")
-    NUM_WORKERS = 0  # Windows works better with 0 workers (use main thread)
+    NUM_WORKERS = 0
     RANDOM_STATE = 42
     
-    # Performance settings
-    PIN_MEMORY = False  # False for CPU
+    # Performance
+    PIN_MEMORY = False
     PERSISTENT_WORKERS = False
     PREFETCH_FACTOR = 2
     
@@ -109,8 +106,8 @@ class Config:
 class ProductionConfig(Config):
     """Production environment configuration"""
     DEBUG = False
-    BATCH_SIZE = 96  # Increased for powerful CPU
-    NUM_WORKERS = 0  # Keep 0 for Windows
+    BATCH_SIZE = 96
+    NUM_WORKERS = 0
     LOG_LEVEL = 'WARNING'
 
 
@@ -129,21 +126,19 @@ class ExperimentConfig(Config):
     EPOCHS = 50
     LEARNING_RATE = 0.0005
     LOG_LEVEL = 'INFO'
-    
-    # Experiment tracking
     EXPERIMENT_NAME = 'baseline'
     TRACK_EXPERIMENTS = True
     MLFLOW_TRACKING_URI = './mlruns'
 
 
 class FastTestConfig(Config):
-    """Fast testing configuration - Quick validation"""
+    """Fast testing configuration"""
     DEBUG = True
-    BATCH_SIZE = 96  # Large batch for speed test
-    EPOCHS = 3  # Few epochs
+    BATCH_SIZE = 96
+    EPOCHS = 3
     NUM_WORKERS = 0
     LOG_LEVEL = 'INFO'
-    MAX_SEQ_LEN = 20  # Shorter sequences
+    MAX_SEQ_LEN = 20
 
 
 def get_config(env='development'):
@@ -156,12 +151,14 @@ def get_config(env='development'):
     }
     config = configs.get(env, DevelopmentConfig)
     
-    # Print config info
-    print(f"\n📋 Config loaded: {env}")
-    print(f"   Batch size: {config.BATCH_SIZE}")
-    print(f"   Workers: {config.NUM_WORKERS}")
-    print(f"   Device: {config.DEVICE}")
-    print()
+    print(f"\n📋 Config loaded: {env}", flush=True)
+    print(f"   Batch size: {config.BATCH_SIZE}", flush=True)
+    print(f"   Workers: {config.NUM_WORKERS}", flush=True)
+    print(f"   Device: {config.DEVICE}", flush=True)
+    print(f"   DATA_DIR: {config.DATA_DIR}", flush=True)
+    print(f"   RAW_DATA_PATH: {config.RAW_DATA_PATH}", flush=True)
+    print(f"   File exists: {config.RAW_DATA_PATH.exists()}", flush=True)
+    print(flush=True)
     
     return config
 
@@ -170,4 +167,4 @@ if __name__ == "__main__":
     print("Testing configuration...")
     for env in ['development', 'production', 'fast']:
         cfg = get_config(env)
-        print(f"✅ {env}: batch_size={cfg.BATCH_SIZE}")
+        print(f"✅ {env}: batch_size={cfg.BATCH_SIZE}, data_exists={cfg.RAW_DATA_PATH.exists()}")

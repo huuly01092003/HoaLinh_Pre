@@ -93,17 +93,20 @@ class SalesSequenceDataset(Dataset):
             customer_features.values, dtype=torch.float
         )
         
-        # Targets - FIXED: Filter unknown products
+        # Targets - Map products to IDs
         target_products = []
+        max_valid_id = len(self.product_to_id) - 1  # 0-indexed
+
         for p in self.sequences['next_product']:
-            # Get product ID, use 0 for unknown products
-            pid = self.product_to_id.get(p, 0)
-            # Ensure ID is within valid range (0 to num_products)
-            max_id = len(self.product_to_id)
-            if pid > max_id:
+            pid = self.product_to_id.get(p, 0)  # Default to 0 if unknown
+            
+            # Safety check: ensure ID is in valid rangze [0, num_products-1]
+            if pid < 0 or pid > max_valid_id:
+                print(f"WARNING: Invalid product ID {pid} for product {p}, using 0")
                 pid = 0
+            
             target_products.append(pid)
-        
+
         self.target_product = torch.tensor(target_products, dtype=torch.long)
         
         self.target_qty = torch.tensor(

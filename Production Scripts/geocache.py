@@ -68,7 +68,7 @@ class GeoCache:
         if cache_file and cache_file.exists():
             self.load_cache()
         
-        print(f"✓ GeoCache initialized: 34 provinces (Nghị quyết 202/2025/QH15)")
+        pass
     
     def _build_mapping(self) -> Dict[str, str]:
         """Build complete old-to-new province mapping"""

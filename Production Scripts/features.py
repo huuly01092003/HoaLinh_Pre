@@ -83,7 +83,15 @@ class FeatureEngineer:
         
         for col in numeric_columns:
             if col in self.df.columns:
-                self.df[col] = pd.to_numeric(self.df[col], errors='coerce').fillna(0)
+                # ✅ FIX: Force convert to numeric
+                self.df[col] = pd.to_numeric(
+                    self.df[col].astype(str).str.replace(',', ''),  # Remove commas
+                    errors='coerce'
+                ).fillna(0)
+                
+                # ✅ VALIDATE: Check if still all zeros
+                if self.df[col].sum() == 0:
+                    logger.warning(f"⚠️ Column {col} is all zeros after conversion!")
         
         return self
     
@@ -338,7 +346,10 @@ class FeatureEngineer:
         return self
     
     def encode_categorical(self, fit_mode: bool = True):
-        """Encode categorical variables"""
+        """
+        Encode categorical variables with unknown handling
+        CRITICAL: Val/Test may have new categories not in Train
+        """
         logger.info("Encoding categorical variables...")
         
         cat_cols = [
@@ -347,16 +358,44 @@ class FeatureEngineer:
         ]
         
         for col in cat_cols:
-            if col in self.df.columns:
-                if fit_mode:
-                    self.encoders[col] = LabelEncoder()
-                    self.df[f'{col}_encoded'] = self.encoders[col].fit_transform(
-                        self.df[col].astype(str).fillna('Unknown')
+            if col not in self.df.columns:
+                continue
+            
+            if fit_mode:
+                # TRAIN: Fit encoder
+                self.encoders[col] = LabelEncoder()
+                values = self.df[col].astype(str).fillna('Unknown')
+                
+                # Add '__UNKNOWN__' placeholder for future unseen values
+                unique_vals = values.unique().tolist()
+                if '__UNKNOWN__' not in unique_vals:
+                    unique_vals.append('__UNKNOWN__')
+                
+                self.encoders[col].fit(unique_vals)
+                self.df[f'{col}_encoded'] = self.encoders[col].transform(values)
+                
+                logger.info(f"  {col}: {len(self.encoders[col].classes_)} classes")
+            
+            else:
+                # VAL/TEST: Handle unknown values
+                values = self.df[col].astype(str).fillna('Unknown')
+                known_classes = set(self.encoders[col].classes_)
+                
+                # Map unknown to '__UNKNOWN__'
+                safe_values = values.apply(
+                    lambda v: v if v in known_classes else '__UNKNOWN__'
+                )
+                
+                # Count and log unknowns
+                n_unknown = (values != safe_values).sum()
+                if n_unknown > 0:
+                    unknown_vals = values[values != safe_values].unique()
+                    logger.warning(
+                        f"  ⚠️ {col}: {n_unknown} unknown values → __UNKNOWN__"
                     )
-                else:
-                    self.df[f'{col}_encoded'] = self.encoders[col].transform(
-                        self.df[col].astype(str).fillna('Unknown')
-                    )
+                    logger.warning(f"     New values: {list(unknown_vals)[:5]}")
+                
+                self.df[f'{col}_encoded'] = self.encoders[col].transform(safe_values)
         
         return self
     
@@ -367,7 +406,7 @@ class FeatureEngineer:
         sequences = []
         
         for customer_id, group in tqdm(self.df.groupby('MÃ KHÁCH HÀNG'), 
-                                       desc="Creating sequences"):
+                                    desc="Creating sequences"):
             group = group.sort_values('NGÀY TẠO ĐƠN BÁN').reset_index(drop=True)
             
             if len(group) == 0:
@@ -410,6 +449,7 @@ class FeatureEngineer:
                 'is_weekend': latest['is_weekend'],
                 'hour': latest['hour'],
                 'day_of_week': latest['day_of_week'],
+                'day_of_month': latest['day_of_month'],  # ✅ THÊM DÒNG NÀY
                 'month': latest['month'],
                 'quarter': latest['quarter'],
                 'next_product': product_seq[-1] if product_seq else 'UNKNOWN',
