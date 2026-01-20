@@ -1,295 +1,308 @@
 """
-Optimized Training Module for Large Datasets
-Handles 2.4M+ rows efficiently with gradient accumulation and mixed precision
+Complete Time-Series Training Script
+Run: python train_timeseries.py --env development --epochs 20
 """
 
+import argparse
+import logging
+import sys
+from pathlib import Path
+import pandas as pd
+import numpy as np
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 from tqdm import tqdm
-import numpy as np
-from sklearn.metrics import mean_absolute_error, mean_squared_error
-from pathlib import Path
-import logging
-from typing import Dict, Tuple
 import gc
+from datetime import datetime
 
-logger = logging.getLogger(__name__)
+# Force immediate output
+sys.stdout.reconfigure(line_buffering=True)
+sys.stderr.reconfigure(line_buffering=True)
+
+print("\n[TRAIN] Starting imports...", flush=True)
+
+from config import get_config
+from model import create_timeseries_model
+
+print("[TRAIN] All imports successful!", flush=True)
 
 
-class OptimizedTrainer:
-    """Memory-efficient training orchestrator for large datasets"""
+def setup_logging(config):
+    """Setup logging"""
+    log_file = config.LOGS_DIR / f'training_{pd.Timestamp.now().strftime("%Y%m%d_%H%M%S")}.log'
     
-    def __init__(
-        self,
-        model: nn.Module,
-        train_loader: DataLoader,
-        val_loader: DataLoader,
-        config,
-        save_dir: Path = None,
-        accumulation_steps: int = 4  # Gradient accumulation
-    ):
+    logging.basicConfig(
+        level=config.LOG_LEVEL,
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+        handlers=[
+            logging.FileHandler(log_file, encoding='utf-8'),
+            logging.StreamHandler(sys.stdout)
+        ]
+    )
+    
+    logger = logging.getLogger(__name__)
+    logger.info(f"Logging to: {log_file}")
+    return logger
+
+
+def load_checkpoint_data(config):
+    """Load data from checkpoint saved by main.py"""
+    checkpoint_path = config.MODEL_DIR / 'timeseries_checkpoint.pth'
+    
+    if not checkpoint_path.exists():
+        raise FileNotFoundError(
+            f"Checkpoint not found: {checkpoint_path}\n"
+            f"Please run 'python main.py --env development' first!"
+        )
+    
+    print(f"\n[LOAD] Loading checkpoint: {checkpoint_path}")
+    checkpoint = torch.load(checkpoint_path, map_location=config.DEVICE, weights_only=False)
+    
+    print(f"[LOAD] ✅ Checkpoint loaded:")
+    print(f"  - Products: {checkpoint['num_products']}")
+    print(f"  - Encoders: {len(checkpoint['encoders'])}")
+    
+    return checkpoint
+
+
+class TimeAwareLoss(nn.Module):
+    """
+    Time-aware loss that weights recent predictions more heavily
+    """
+    def __init__(self, alpha_product=1.0, alpha_qty=0.5, alpha_revenue=1.5, alpha_discount=0.3):
+        super().__init__()
+        self.alpha_product = alpha_product
+        self.alpha_qty = alpha_qty
+        self.alpha_revenue = alpha_revenue
+        self.alpha_discount = alpha_discount
+        
+        self.criterion_cls = nn.CrossEntropyLoss()
+        self.criterion_reg = nn.SmoothL1Loss()
+    
+    def forward(self, outputs, targets):
+        """
+        outputs: dict with keys 'product', 'quantity', 'revenue', 'discount'
+        targets: dict with same keys
+        """
+        loss_product = self.criterion_cls(outputs['product'], targets['product'])
+        loss_qty = self.criterion_reg(outputs['quantity'], targets['quantity'])
+        loss_revenue = self.criterion_reg(outputs['revenue'], targets['revenue'])
+        loss_discount = self.criterion_reg(outputs['discount'], targets['discount'])
+        
+        # Weighted multi-task loss
+        total_loss = (
+            self.alpha_product * loss_product +
+            self.alpha_qty * loss_qty +
+            self.alpha_revenue * loss_revenue +
+            self.alpha_discount * loss_discount
+        )
+        
+        return total_loss, {
+            'product': loss_product.item(),
+            'quantity': loss_qty.item(),
+            'revenue': loss_revenue.item(),
+            'discount': loss_discount.item()
+        }
+
+
+class TimeSeriesTrainer:
+    """Training orchestrator for time-series model"""
+    
+    def __init__(self, model, train_loader, val_loader, config, logger):
         self.model = model
         self.train_loader = train_loader
         self.val_loader = val_loader
         self.config = config
-        self.save_dir = save_dir or config.MODEL_DIR
-        self.accumulation_steps = accumulation_steps
+        self.logger = logger
         
         self.device = config.DEVICE
         self.model.to(self.device)
         
-        # Optimizer with gradient clipping
+        # Optimizer
         self.optimizer = torch.optim.AdamW(
             model.parameters(),
             lr=config.LEARNING_RATE,
-            weight_decay=config.WEIGHT_DECAY,
-            eps=1e-8
+            weight_decay=config.WEIGHT_DECAY
         )
         
-        # Cosine annealing with warm restarts
+        # Scheduler
         self.scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
             self.optimizer, T_0=5, T_mult=2, eta_min=1e-6
         )
         
-        # Loss functions
-        self.criterion_cls = nn.CrossEntropyLoss()
-        self.criterion_reg = nn.SmoothL1Loss()
+        # Loss function
+        self.criterion = TimeAwareLoss()
         
-        # Early stopping
+        # Tracking
         self.best_val_loss = float('inf')
         self.patience_counter = 0
-        
-        # History
         self.history = {
-            'train_loss': [], 'train_acc': [],
-            'val_loss': [], 'val_acc': [],
-            'val_mae': [], 'val_rmse': [],
+            'train_loss': [], 'val_loss': [],
+            'train_acc': [], 'val_acc': [],
             'lr': []
         }
-        
-        logger.info(f"✅ Trainer initialized with gradient accumulation: {accumulation_steps}")
     
-    def train_epoch(self) -> Tuple[float, float]:
-        """Train for one epoch with gradient accumulation"""
+    def train_epoch(self):
+        """Train one epoch"""
         self.model.train()
         total_loss = 0
-        product_correct = 0
+        total_correct = 0
         total_samples = 0
         
         pbar = tqdm(self.train_loader, desc="Training", ncols=100)
         
-        self.optimizer.zero_grad()
-        
-        for i, batch in enumerate(pbar):
+        for batch in pbar:
             # Move to device
-            batch = {k: v.to(self.device) for k, v in batch.items()}
+            batch = {k: v.to(self.device) if isinstance(v, torch.Tensor) else v 
+                    for k, v in batch.items()}
             
-            # Forward pass
+            # Forward
+            self.optimizer.zero_grad()
+            
             outputs = self.model(
                 batch['product_ids'],
                 batch['qty'],
                 batch['revenue'],
                 batch['discount'],
-                batch['week_change'],
-                batch['month_change'],
-                batch['quarter_change'],
-                batch['year_change'],
-                batch['customer_features']
+                batch['customer_features'],
+                batch['target_time_features']
             )
             
-            # Calculate losses
-            loss_product = self.criterion_cls(outputs['product'], batch['target_product'])
-            loss_qty = self.criterion_reg(outputs['quantity'], batch['target_qty'])
-            loss_revenue = self.criterion_reg(outputs['revenue'], batch['target_revenue'])
-            loss_discount = self.criterion_reg(outputs['discount'], batch['target_discount'])
+            # Loss
+            targets = {
+                'product': batch['target_product'],
+                'quantity': batch['target_qty'],
+                'revenue': batch['target_revenue'],
+                'discount': batch['target_discount']
+            }
             
-            # Weighted multi-task loss
-            loss = (
-                1.0 * loss_product +
-                0.5 * loss_qty +
-                1.5 * loss_revenue +
-                0.3 * loss_discount
-            )
+            loss, loss_dict = self.criterion(outputs, targets)
             
-            # Scale loss for gradient accumulation
-            loss = loss / self.accumulation_steps
-            
-            # Backward pass
+            # Backward
             loss.backward()
-            
-            # Gradient accumulation: only step every N batches
-            if (i + 1) % self.accumulation_steps == 0:
-                torch.nn.utils.clip_grad_norm_(
-                    self.model.parameters(), self.config.GRADIENT_CLIP
-                )
-                self.optimizer.step()
-                self.optimizer.zero_grad()
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.GRADIENT_CLIP)
+            self.optimizer.step()
             
             # Metrics
-            total_loss += loss.item() * self.accumulation_steps
+            total_loss += loss.item()
             _, predicted = outputs['product'].max(1)
-            product_correct += (predicted == batch['target_product']).sum().item()
-            total_samples += batch['target_product'].size(0)
+            total_correct += (predicted == targets['product']).sum().item()
+            total_samples += targets['product'].size(0)
             
-            # Update progress bar
-            current_acc = product_correct / total_samples
+            # Update progress
             pbar.set_postfix({
-                'loss': f"{loss.item() * self.accumulation_steps:.4f}",
-                'acc': f"{current_acc:.4f}"
+                'loss': f"{loss.item():.4f}",
+                'acc': f"{total_correct/total_samples:.4f}"
             })
-            
-            # Clean up
-            if i % 100 == 0:
-                torch.cuda.empty_cache() if torch.cuda.is_available() else None
-        
-        # Final step if needed
-        if len(self.train_loader) % self.accumulation_steps != 0:
-            torch.nn.utils.clip_grad_norm_(
-                self.model.parameters(), self.config.GRADIENT_CLIP
-            )
-            self.optimizer.step()
-            self.optimizer.zero_grad()
         
         avg_loss = total_loss / len(self.train_loader)
-        accuracy = product_correct / total_samples
+        accuracy = total_correct / total_samples
         
         return avg_loss, accuracy
     
     @torch.no_grad()
-    def validate(self, dataloader: DataLoader = None) -> Tuple[float, float, float, float]:
-        """Validate model efficiently"""
-        if dataloader is None:
-            dataloader = self.val_loader
-        
+    def validate(self):
+        """Validate model"""
         self.model.eval()
         total_loss = 0
-        product_correct = 0
+        total_correct = 0
         total_samples = 0
         
-        # Use lists for memory efficiency
-        revenue_preds = []
-        revenue_targets = []
-        
-        pbar = tqdm(dataloader, desc="Validating", ncols=100)
-        
-        for batch in pbar:
-            batch = {k: v.to(self.device) for k, v in batch.items()}
+        for batch in tqdm(self.val_loader, desc="Validating", ncols=100):
+            batch = {k: v.to(self.device) if isinstance(v, torch.Tensor) else v 
+                    for k, v in batch.items()}
             
             outputs = self.model(
                 batch['product_ids'],
                 batch['qty'],
                 batch['revenue'],
                 batch['discount'],
-                batch['week_change'],
-                batch['month_change'],
-                batch['quarter_change'],
-                batch['year_change'],
-                batch['customer_features']
+                batch['customer_features'],
+                batch['target_time_features']
             )
             
-            # Losses
-            loss_product = self.criterion_cls(outputs['product'], batch['target_product'])
-            loss_qty = self.criterion_reg(outputs['quantity'], batch['target_qty'])
-            loss_revenue = self.criterion_reg(outputs['revenue'], batch['target_revenue'])
-            loss_discount = self.criterion_reg(outputs['discount'], batch['target_discount'])
+            targets = {
+                'product': batch['target_product'],
+                'quantity': batch['target_qty'],
+                'revenue': batch['target_revenue'],
+                'discount': batch['target_discount']
+            }
             
-            loss = (
-                1.0 * loss_product +
-                0.5 * loss_qty +
-                1.5 * loss_revenue +
-                0.3 * loss_discount
-            )
+            loss, _ = self.criterion(outputs, targets)
             
             total_loss += loss.item()
-            
-            # Accuracy
             _, predicted = outputs['product'].max(1)
-            product_correct += (predicted == batch['target_product']).sum().item()
-            total_samples += batch['target_product'].size(0)
-            
-            # Collect predictions (move to CPU immediately)
-            revenue_preds.extend(outputs['revenue'].cpu().squeeze().tolist())
-            revenue_targets.extend(batch['target_revenue'].cpu().squeeze().tolist())
+            total_correct += (predicted == targets['product']).sum().item()
+            total_samples += targets['product'].size(0)
         
-        avg_loss = total_loss / len(dataloader)
-        accuracy = product_correct / total_samples
-        mae = mean_absolute_error(revenue_targets, revenue_preds)
-        rmse = np.sqrt(mean_squared_error(revenue_targets, revenue_preds))
+        avg_loss = total_loss / len(self.val_loader)
+        accuracy = total_correct / total_samples
         
-        return avg_loss, accuracy, mae, rmse
+        return avg_loss, accuracy
     
-    def train(self, epochs: int = None):
-        """Full training loop with memory management"""
-        if epochs is None:
-            epochs = self.config.EPOCHS
-        
-        logger.info(f"\n{'='*80}")
-        logger.info(f"Starting training for {epochs} epochs")
-        logger.info(f"Gradient accumulation steps: {self.accumulation_steps}")
-        logger.info(f"Effective batch size: {self.config.BATCH_SIZE * self.accumulation_steps}")
-        logger.info(f"{'='*80}\n")
+    def train(self, epochs):
+        """Full training loop"""
+        self.logger.info("\n" + "="*80)
+        self.logger.info("STARTING TIME-SERIES TRAINING")
+        self.logger.info("="*80)
+        self.logger.info(f"Epochs: {epochs}")
+        self.logger.info(f"Train batches: {len(self.train_loader)}")
+        self.logger.info(f"Val batches: {len(self.val_loader)}")
+        self.logger.info("="*80 + "\n")
         
         for epoch in range(epochs):
-            logger.info(f"\nEpoch {epoch+1}/{epochs}")
-            logger.info("="*80)
+            self.logger.info(f"\n{'='*80}")
+            self.logger.info(f"EPOCH {epoch+1}/{epochs}")
+            self.logger.info("="*80)
             
             # Train
             train_loss, train_acc = self.train_epoch()
             
             # Validate
-            val_loss, val_acc, val_mae, val_rmse = self.validate()
+            val_loss, val_acc = self.validate()
             
-            # Scheduler step
+            # Scheduler
             self.scheduler.step()
             current_lr = self.optimizer.param_groups[0]['lr']
             
-            # Log metrics
+            # Log
             self.history['train_loss'].append(train_loss)
             self.history['train_acc'].append(train_acc)
             self.history['val_loss'].append(val_loss)
             self.history['val_acc'].append(val_acc)
-            self.history['val_mae'].append(val_mae)
-            self.history['val_rmse'].append(val_rmse)
             self.history['lr'].append(current_lr)
             
-            logger.info(f"Train Loss: {train_loss:.4f} | Train Acc: {train_acc*100:.2f}%")
-            logger.info(f"Val Loss: {val_loss:.4f} | Val Acc: {val_acc*100:.2f}%")
-            logger.info(f"Revenue MAE: {val_mae:,.0f} | RMSE: {val_rmse:,.0f}")
-            logger.info(f"Learning Rate: {current_lr:.6f}")
+            self.logger.info(f"Train Loss: {train_loss:.4f} | Train Acc: {train_acc*100:.2f}%")
+            self.logger.info(f"Val Loss: {val_loss:.4f} | Val Acc: {val_acc*100:.2f}%")
+            self.logger.info(f"Learning Rate: {current_lr:.6f}")
             
-            # Early stopping and checkpointing
+            # Save best
             if val_loss < self.best_val_loss:
                 improvement = self.best_val_loss - val_loss
                 self.best_val_loss = val_loss
                 self.patience_counter = 0
                 self.save_checkpoint(epoch, is_best=True)
-                logger.info(f"✅ Best model saved! (improved by {improvement:.4f})")
+                self.logger.info(f"✅ Best model saved! (improved by {improvement:.4f})")
             else:
                 self.patience_counter += 1
-                logger.info(f"⚠️  No improvement ({self.patience_counter}/{self.config.PATIENCE})")
+                self.logger.info(f"⚠️ No improvement ({self.patience_counter}/{self.config.PATIENCE})")
                 
                 if self.patience_counter >= self.config.PATIENCE:
-                    logger.info(f"⏹️ Early stopping triggered at epoch {epoch+1}")
+                    self.logger.info(f"⏹️ Early stopping at epoch {epoch+1}")
                     break
-            
-            # Regular checkpoint
-            if (epoch + 1) % 5 == 0:
-                self.save_checkpoint(epoch, is_best=False)
             
             # Memory cleanup
             gc.collect()
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
         
-        logger.info("\n" + "="*80)
-        logger.info("✅ Training complete!")
-        logger.info(f"Best validation loss: {self.best_val_loss:.4f}")
-        logger.info("="*80 + "\n")
+        self.logger.info("\n" + "="*80)
+        self.logger.info("✅ TRAINING COMPLETE!")
+        self.logger.info(f"Best Val Loss: {self.best_val_loss:.4f}")
+        self.logger.info("="*80 + "\n")
         
         return self.history
     
-    def save_checkpoint(self, epoch: int, is_best: bool = False):
+    def save_checkpoint(self, epoch, is_best=False):
         """Save model checkpoint"""
         checkpoint = {
             'epoch': epoch,
@@ -297,104 +310,105 @@ class OptimizedTrainer:
             'optimizer_state_dict': self.optimizer.state_dict(),
             'scheduler_state_dict': self.scheduler.state_dict(),
             'best_val_loss': self.best_val_loss,
-            'history': self.history,
-            'config': self.config.to_dict()
+            'history': self.history
         }
         
         if is_best:
-            path = self.save_dir / 'best_model.pth'
+            path = self.config.MODEL_DIR / 'best_timeseries_model.pth'
         else:
-            path = self.save_dir / f'checkpoint_epoch_{epoch+1}.pth'
+            path = self.config.MODEL_DIR / f'checkpoint_epoch_{epoch+1}.pth'
         
         torch.save(checkpoint, path)
-        logger.info(f"💾 Checkpoint saved: {path.name}")
-    
-    def load_checkpoint(self, path: Path):
-        """Load model checkpoint"""
-        checkpoint = torch.load(path, map_location=self.device, weights_only=False)
-        self.model.load_state_dict(checkpoint['model_state_dict'])
-        self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-        self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
-        self.best_val_loss = checkpoint['best_val_loss']
-        self.history = checkpoint.get('history', self.history)
-        logger.info(f"✅ Checkpoint loaded from {path}")
+        self.logger.info(f"💾 Saved: {path.name}")
 
 
-@torch.no_grad()
-def evaluate_model(
-    model: nn.Module,
-    test_loader: DataLoader,
-    device: torch.device
-) -> Tuple[Dict[str, float], Dict, Dict]:
-    """Evaluate model on test set efficiently"""
-    model.eval()
+def main(args):
+    """Main training pipeline"""
     
-    criterion_cls = nn.CrossEntropyLoss()
-    criterion_reg = nn.SmoothL1Loss()
+    print("\n[TRAIN] Starting training pipeline...", flush=True)
     
-    product_correct = 0
-    total_samples = 0
-    
-    all_preds = {
-        'product': [], 'quantity': [], 'revenue': [], 'discount': []
-    }
-    all_targets = {
-        'product': [], 'quantity': [], 'revenue': [], 'discount': []
-    }
+    # Config
+    config = get_config(args.env)
+    logger = setup_logging(config)
     
     logger.info("\n" + "="*80)
-    logger.info("FINAL EVALUATION ON TEST SET")
+    logger.info("TIME-SERIES TRAINING PIPELINE")
     logger.info("="*80)
-    
-    for batch in tqdm(test_loader, desc="Testing", ncols=100):
-        batch = {k: v.to(device) for k, v in batch.items()}
-        
-        outputs = model(
-            batch['product_ids'],
-            batch['qty'],
-            batch['revenue'],
-            batch['discount'],
-            batch['week_change'],
-            batch['month_change'],
-            batch['quarter_change'],
-            batch['year_change'],
-            batch['customer_features']
-        )
-        
-        # Collect predictions and targets (move to CPU immediately)
-        _, predicted = outputs['product'].max(1)
-        all_preds['product'].extend(predicted.cpu().tolist())
-        all_targets['product'].extend(batch['target_product'].cpu().tolist())
-        
-        all_preds['quantity'].extend(outputs['quantity'].cpu().squeeze().tolist())
-        all_targets['quantity'].extend(batch['target_qty'].cpu().squeeze().tolist())
-        
-        all_preds['revenue'].extend(outputs['revenue'].cpu().squeeze().tolist())
-        all_targets['revenue'].extend(batch['target_revenue'].cpu().squeeze().tolist())
-        
-        all_preds['discount'].extend(outputs['discount'].cpu().squeeze().tolist())
-        all_targets['discount'].extend(batch['target_discount'].cpu().squeeze().tolist())
-        
-        product_correct += (predicted == batch['target_product']).sum().item()
-        total_samples += batch['target_product'].size(0)
-    
-    # Calculate metrics
-    metrics = {
-        'product_accuracy': product_correct / total_samples,
-        'revenue_mae': mean_absolute_error(all_targets['revenue'], all_preds['revenue']),
-        'revenue_rmse': np.sqrt(mean_squared_error(all_targets['revenue'], all_preds['revenue'])),
-        'quantity_mae': mean_absolute_error(all_targets['quantity'], all_preds['quantity']),
-        'quantity_rmse': np.sqrt(mean_squared_error(all_targets['quantity'], all_preds['quantity'])),
-        'discount_mae': mean_absolute_error(all_targets['discount'], all_preds['discount'])
-    }
-    
-    logger.info("\n📊 TEST RESULTS:")
-    logger.info(f"  Product Accuracy: {metrics['product_accuracy']*100:.2f}%")
-    logger.info(f"  Revenue MAE: {metrics['revenue_mae']:,.0f} VND")
-    logger.info(f"  Revenue RMSE: {metrics['revenue_rmse']:,.0f} VND")
-    logger.info(f"  Quantity MAE: {metrics['quantity_mae']:.2f}")
-    logger.info(f"  Quantity RMSE: {metrics['quantity_rmse']:.2f}")
-    logger.info(f"  Discount MAE: {metrics['discount_mae']:.4f}")
+    logger.info(f"Environment: {args.env}")
+    logger.info(f"Device: {config.DEVICE}")
+    logger.info(f"Epochs: {args.epochs}")
     logger.info("="*80 + "\n")
     
-    return metrics, all_preds, all_targets
+    # Load checkpoint data
+    checkpoint_data = load_checkpoint_data(config)
+    num_products = checkpoint_data['num_products']
+    
+    # Load dataloaders (they should be saved from main.py)
+    # For now, we'll need to recreate them from sequences
+    logger.info("\n[LOAD] Loading processed sequences...")
+    
+    # Load sequences from processed directory
+    from data_manager import DataManager
+    data_manager = DataManager(config.PROCESSED_DATA_PATH, use_compression=True)
+    
+    try:
+        train_sequences, val_sequences, test_sequences = data_manager.load_sequences('latest')
+        product_to_id, encoders = data_manager.load_mappings('latest')
+        logger.info("✅ Loaded from cache!")
+    except Exception as e:
+        logger.error(f"Failed to load sequences: {e}")
+        logger.error("Please run 'python main.py --env development' first!")
+        return
+    
+    # Create datasets and loaders
+    logger.info("\n[DATASET] Creating dataloaders...")
+    from dataset import create_dataloaders
+    
+    train_loader, val_loader, test_loader = create_dataloaders(
+        train_sequences, val_sequences, test_sequences,
+        product_to_id, config
+    )
+    
+    # Create model
+    logger.info("\n[MODEL] Creating time-series model...")
+    model = create_timeseries_model(config, num_products)
+    
+    # Train
+    trainer = TimeSeriesTrainer(model, train_loader, val_loader, config, logger)
+    history = trainer.train(args.epochs)
+    
+    # Final save
+    logger.info("\n[SAVE] Saving final model...")
+    final_checkpoint = {
+        'model_state_dict': model.state_dict(),
+        'product_to_id': product_to_id,
+        'num_products': num_products,
+        'encoders': encoders,
+        'history': history,
+        'config': config.to_dict()
+    }
+    
+    final_path = config.MODEL_DIR / 'final_timeseries_model.pth'
+    torch.save(final_checkpoint, final_path)
+    logger.info(f"✅ Final model saved: {final_path}")
+    
+    logger.info("\n" + "="*80)
+    logger.info("🎉 ALL DONE!")
+    logger.info("="*80)
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description='Train Time-Series Model')
+    parser.add_argument('--env', type=str, default='development',
+                       choices=['development', 'production', 'fast'])
+    parser.add_argument('--epochs', type=int, default=20,
+                       help='Number of training epochs')
+    
+    args = parser.parse_args()
+    
+    try:
+        main(args)
+    except Exception as e:
+        print(f"\n[TRAIN] ❌ FATAL ERROR: {e}", flush=True)
+        logging.error(f"Training failed: {e}", exc_info=True)
+        raise

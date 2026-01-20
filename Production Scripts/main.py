@@ -406,16 +406,36 @@ def main(args):
     logger.info("  4. ⏳ Need to implement training loop")
     
     # Save checkpoint
+    # Save checkpoint FOR TRAINING
+    logger.info("\n[SAVE] Saving data for training...")
+
+    # Save sequences to processed directory
+    from data_manager import DataManager
+    data_manager = DataManager(config.PROCESSED_DATA_PATH, use_compression=True)
+
+    data_manager.save_sequences(train_sequences, val_sequences, test_sequences, version='latest')
+    data_manager.save_mappings(product_to_id, train_engineer.encoders, version='latest')
+
+    logger.info(f"✅ Sequences and mappings saved to: {config.PROCESSED_DATA_PATH}")
+
+    # Also save minimal checkpoint
     checkpoint = {
         'product_to_id': product_to_id,
         'num_products': num_products,
         'encoders': train_engineer.encoders,
         'config': config.to_dict()
     }
-    
+
     checkpoint_path = config.MODEL_DIR / 'timeseries_checkpoint.pth'
     torch.save(checkpoint, checkpoint_path)
-    logger.info(f"\n💾 Checkpoint saved: {checkpoint_path}")
+    logger.info(f"💾 Checkpoint saved: {checkpoint_path}")
+
+    logger.info("\n" + "="*80)
+    logger.info("✅ DATA PREPARATION COMPLETE!")
+    logger.info("="*80)
+    logger.info("\nNext step: Run training with:")
+    logger.info(f"  python train_timeseries.py --env {args.env} --epochs 20")
+    logger.info("="*80 + "\n")
 
 
 if __name__ == "__main__":
