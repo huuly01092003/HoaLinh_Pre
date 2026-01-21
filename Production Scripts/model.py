@@ -1,6 +1,7 @@
 """
 Time-Series Aware Sales Forecasting Model
 Predicts customer behavior for a SPECIFIC future date
+FIXED: Dimension mismatch in TimeEmbedding
 """
 
 import torch
@@ -16,6 +17,14 @@ class TimeEmbedding(nn.Module):
     def __init__(self, d_model: int):
         super().__init__()
         self.d_model = d_model
+        
+        # ✅ FIX: Use simple linear projection instead of complex sinusoidal
+        self.time_projection = nn.Sequential(
+            nn.Linear(4, d_model // 2),  # 4 time features -> d_model/2
+            nn.ReLU(),
+            nn.Linear(d_model // 2, d_model),
+            nn.LayerNorm(d_model)
+        )
     
     def forward(self, time_features: torch.Tensor):
         """
@@ -24,38 +33,8 @@ class TimeEmbedding(nn.Module):
         Returns:
             [batch, d_model] time embeddings
         """
-        batch_size = time_features.size(0)
-        
-        # Separate features
-        day_of_week = time_features[:, 0]  # 0-6
-        day_of_month = time_features[:, 1]  # 1-31
-        month = time_features[:, 2]  # 1-12
-        days_until = time_features[:, 3]  # forecast horizon
-        
-        # Sinusoidal encoding for each temporal feature
-        def encode(values, max_val, dim):
-            # Normalize to [0, 1]
-            normalized = values / max_val
-            # Create position encodings
-            pe = torch.zeros(batch_size, dim // 4, device=values.device)
-            position = normalized.unsqueeze(1)
-            
-            div_term = torch.exp(torch.arange(0, dim // 4, 2, device=values.device).float() * 
-                                 (-math.log(10000.0) / (dim // 4)))
-            
-            pe[:, 0::2] = torch.sin(position * div_term)
-            pe[:, 1::2] = torch.cos(position * div_term)
-            return pe
-        
-        # Encode each temporal dimension
-        dow_enc = encode(day_of_week, 7, self.d_model)
-        dom_enc = encode(day_of_month, 31, self.d_model)
-        month_enc = encode(month, 12, self.d_model)
-        horizon_enc = encode(days_until, 30, self.d_model)
-        
-        # Combine
-        time_emb = dow_enc + dom_enc + month_enc + horizon_enc
-        return time_emb
+        # Simple projection to d_model dimensions
+        return self.time_projection(time_features)
 
 
 class TimeSeriesSalesModel(nn.Module):
@@ -119,8 +98,20 @@ class TimeSeriesSalesModel(nn.Module):
             nn.LayerNorm(hidden_size // 2)
         )
         
+        # ✅ FIX: Calculate correct fusion input size
+        # sequence_repr: hidden_size * 2 (bidirectional LSTM)
+        # time_emb: embed_dim
+        # customer_repr: hidden_size // 2
+        fusion_input_size = (hidden_size * 2) + embed_dim + (hidden_size // 2)
+        
+        # Sanity check
+        print(f"[MODEL DEBUG] Fusion input size calculation:")
+        print(f"  - Sequence repr: {hidden_size * 2}")
+        print(f"  - Time embedding: {embed_dim}")
+        print(f"  - Customer repr: {hidden_size // 2}")
+        print(f"  - Total fusion input: {fusion_input_size}")
+        
         # Time-aware fusion
-        fusion_input_size = hidden_size * 2 + embed_dim + hidden_size // 2
         self.fusion = nn.Sequential(
             nn.Linear(fusion_input_size, hidden_size),
             nn.LayerNorm(hidden_size),
@@ -176,7 +167,7 @@ class TimeSeriesSalesModel(nn.Module):
         revenue: torch.Tensor,
         discount: torch.Tensor,
         customer_features: torch.Tensor,
-        target_time_features: torch.Tensor  # NEW: [day_of_week, day_of_month, month, days_until]
+        target_time_features: torch.Tensor  # [batch, 4]
     ) -> Dict[str, torch.Tensor]:
         
         # Product embeddings from history
@@ -203,8 +194,19 @@ class TimeSeriesSalesModel(nn.Module):
         # Customer encoding
         customer_repr = self.customer_encoder(customer_features)
         
+        # ✅ DEBUG: Print shapes before fusion
+        if torch.rand(1).item() < 0.001:  # Print occasionally to avoid spam
+            print(f"[FORWARD DEBUG] Shapes before fusion:")
+            print(f"  sequence_repr: {sequence_repr.shape}")
+            print(f"  time_emb: {time_emb.shape}")
+            print(f"  customer_repr: {customer_repr.shape}")
+        
         # Fusion: history + future time + customer
         combined = torch.cat([sequence_repr, time_emb, customer_repr], dim=-1)
+        
+        if torch.rand(1).item() < 0.001:
+            print(f"  combined: {combined.shape}")
+        
         fused = self.fusion(combined)
         
         # Multi-task predictions

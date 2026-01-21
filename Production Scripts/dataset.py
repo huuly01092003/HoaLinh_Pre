@@ -1,6 +1,7 @@
 """
 PyTorch Dataset for Sales Sequences
 Windows-optimized version (NUM_WORKERS=0)
+FIXED: Added target_time_features for time-series model
 """
 
 import torch
@@ -93,6 +94,29 @@ class SalesSequenceDataset(Dataset):
             customer_features.values, dtype=torch.float
         )
         
+        # ✅ NEW: Target time features for time-series prediction
+        self.target_time_features = []
+        
+        for idx, row in self.sequences.iterrows():
+            # Forecast horizon: assume 7 days ahead
+            days_until_prediction = 7
+            
+            # Extract temporal features of target date
+            target_dow = (row['day_of_week'] + days_until_prediction) % 7
+            target_dom = min(31, row['day_of_month'] + days_until_prediction)
+            target_month = row['month']  # Simplified
+            
+            self.target_time_features.append([
+                target_dow,
+                target_dom,
+                target_month,
+                days_until_prediction
+            ])
+        
+        self.target_time_features = torch.tensor(
+            self.target_time_features, dtype=torch.float
+        )
+        
         # Targets - Map products to IDs
         target_products = []
         max_valid_id = len(self.product_to_id) - 1  # 0-indexed
@@ -100,7 +124,7 @@ class SalesSequenceDataset(Dataset):
         for p in self.sequences['next_product']:
             pid = self.product_to_id.get(p, 0)  # Default to 0 if unknown
             
-            # Safety check: ensure ID is in valid rangze [0, num_products-1]
+            # Safety check: ensure ID is in valid range [0, num_products-1]
             if pid < 0 or pid > max_valid_id:
                 print(f"WARNING: Invalid product ID {pid} for product {p}, using 0")
                 pid = 0
@@ -138,6 +162,7 @@ class SalesSequenceDataset(Dataset):
             'quarter_change': self.quarter_change[idx],
             'year_change': self.year_change[idx],
             'customer_features': self.customer_features[idx],
+            'target_time_features': self.target_time_features[idx],  # ✅ ADDED
             'target_product': self.target_product[idx],
             'target_qty': self.target_qty[idx],
             'target_revenue': self.target_revenue[idx],
